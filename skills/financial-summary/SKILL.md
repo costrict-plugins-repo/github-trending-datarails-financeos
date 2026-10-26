@@ -1,0 +1,274 @@
+---
+name: dr-financial-summary
+description: Quick snapshot of revenue, expenses, gross profit, and margin from real aggregated totals. Self-contained — discovers the client's financials table and fields on its own, no profile or setup step required.
+user-invocable: true
+allowed-tools:
+  - mcp__datarails-finance-os__list_data_models
+  - mcp__datarails-finance-os__list_aliased_fields
+  - mcp__datarails-finance-os__get_fields_by_id
+  - mcp__datarails-finance-os__start_aggregation_by_alias
+  - mcp__datarails-finance-os__get_aggregation_result_by_alias
+  - mcp__datarails-finance-os__get_aggregated_data_by_alias
+  - mcp__datarails-finance-os__start_aggregation_by_id
+  - mcp__datarails-finance-os__get_aggregation_result_by_id
+  - mcp__datarails-finance-os__get_aggregated_data_by_id
+  - mcp__datarails-finance-os__start_distinct_values_by_alias
+  - mcp__datarails-finance-os__get_distinct_values_result_by_alias
+  - mcp__datarails-finance-os__get_distinct_values_by_alias
+  - mcp__datarails-finance-os__start_distinct_values_by_id
+  - mcp__datarails-finance-os__get_distinct_values_result_by_id
+  - mcp__datarails-finance-os__get_distinct_values_by_id
+  - mcp__datarails-finance-os__get_data_by_alias
+  - mcp__datarails-finance-os__get_data_by_id
+  - mcp__datarails-finance-os__list_business_metrics
+argument-hint: "[--scenario <name>] [--year <YYYY>]"
+---
+
+# Financial Summary
+
+## What this skill does
+
+A quick overview of the user's financial data — revenue, key expense
+categories, gross profit, gross margin, monthly trend direction. Built for a
+morning check-in or 30-second meeting prep. Uses the aggregation start→poll
+tools (`start_aggregation_by_alias` → `get_aggregation_result_by_alias`, or
+their by-id twins) for real totals — no row caps, no estimation from samples.
+Totals default to the latest complete fiscal year (or trailing 12 closed
+months), never an unscoped all-time figure, and every snapshot is labeled with
+the period and scenario it covers.
+
+This skill is **self-contained**: it discovers the client's financials table
+and field names itself (Step 2). It does not depend on a
+saved profile, a learn step, or any prior setup — every Datarails environment names its
+table and fields differently, so discovery happens inline, once per
+conversation.
+
+## Workflow
+
+### Step 1: Verify the connection
+
+If any Datarails tool call fails with an authentication or connection error,
+tell the user:
+
+> The Datarails connector isn't connected. Click the **"+"** button next to
+> the prompt, select **Connectors**, find **Datarails**, and click **Connect**.
+
+Then STOP — do not retry until the user reconnects.
+
+### Step 2: Discover the financials table and its fields
+
+**If you already identified the financials table, its field names, and the
+account categories earlier in THIS conversation, reuse them — skip to Step 3.**
+Discovery is cheap but not free; do it once per conversation, then carry the
+values forward.
+
+1. `list_data_models`. Pick the financials table: the one whose name (or alias)
+   matches `/financial|cube|p&?l|ledger|gl/i`; if none match, the largest by
+   row count. Note **both** its numeric `id` and its `alias` (the alias may be
+   empty). **Prefer the alias path when an alias exists** — friendlier field
+   names, far fewer tokens.
+
+2. Fields. If the table has an alias, `list_aliased_fields(<alias>)`; otherwise
+   `get_fields_by_id(<financials_table_id>)` (capture each field's numeric `id`
+   — the by-id tools address fields by id). Bind these by case-insensitive
+   match on the field alias/name (respecting the noted type):
+   - `<amount_field>`   — numeric: `^amount$` → `transaction_amount` → `value`
+   - `<scenario_field>` — categorical: `^scenario$` → `^version$`
+   - `<date_field>`     — date/timestamp: `reporting_date` → `posting_date` → `^date$`
+   - `<account_level_fields>` — categorical: **every** account-hierarchy level
+     field (alias/name matching an account word with a level-like suffix, e.g.
+     `/acc(ount)?.*l\d/i`). Keep all levels as candidates — `<account_field>`
+     (the P&L grain) is chosen in item 3, not here.
+
+> **Alias coverage is per field, not per table.** A table having an alias does *not* mean its fields are aliased — real orgs often expose only a handful of aliased fields (e.g. ~5 of ~185 on a mapped financials table), and the load-bearing fields (`amount`, `scenario`, account groups, dates) are frequently *not* among them. Treat the alias/by-id choice **per field**: `get_fields_by_id(<id>)` returns every field with its numeric `id` and its `alias` (empty if none). Address a field by alias (via the `*_by_alias` tools) when it has one, else by numeric `id` (via the `*_by_id` tools). By-id always works — never abandon the query because the aliased set is thin.
+
+   If `<amount_field>` or `<scenario_field>` has no clear match, ask the user
+   which field to use, then continue.
+
+> **Async fetch — aggregations and distinct values run as start → poll.** `start_aggregation_by_id`/`_by_alias` and `start_distinct_values_by_id`/`_by_alias` take the same arguments as the retired blocking calls (dimensions/metrics/filters; table id + field id, or alias + field alias) and return immediately with `{"status": "pending", "handle": {...}}`. Echo that `handle` back verbatim to the matching `get_aggregation_result_by_*` / `get_distinct_values_result_by_*` tool: a `{"status": "running", "retry_after_seconds": N}` response means poll again with the same handle after ~N seconds (≈5s) — it is not an error, and large jobs may take several polls; when ready, the result arrives in the familiar shape (for distinct values, pass `limit` to the result tool). An expired/unknown-handle error means restart with the `start_*` tool. *Transitional fallback:* if the `start_*` tools aren't available on the connector (older server), the blocking twins `get_aggregated_data_by_*` / `get_distinct_values_by_*` still work with the same arguments.
+
+> **Data-scope discovery — run before any aggregate (reuse anything already discovered this conversation).**
+> 1. **Scenario domain.** Pull distinct values of the scenario field (`start_distinct_values_by_alias`/`_by_id` → poll the matching result tool) — never assume a scenario name exists (`Budget` frequently doesn't; many orgs carry only `{Actuals, Forecast}`). For budget/plan questions, if no budget-like scenario exists, look for a planning-version-like field (alias/name matching `/plan|version|cycle|budget/i`) and use its versions as the plan side; if neither exists, say so and offer a comparison across the scenarios that do exist.
+> 2. **Account grain.** Pull distinct values of each account-hierarchy level field (L0/L1/L2-like). Use the level whose values partition P&L flows into revenue/COGS/opex-like buckets — on many orgs the top level is the balance-sheet equation (ASSET/LIABILITY/EQUITY/INCOME) and P&L line items live one level deeper. For P&L work, scope to P&L flows and exclude balance-sheet buckets; never present asset/liability/equity totals as revenue or expenses.
+> 3. **Period scope.** Discover the date field's range (distinct values of the reporting-month field, or MIN and MAX in two separate calls — one aggregation per field per call). Default every P&L question to the latest complete fiscal year (or trailing 12 closed months) — never an unscoped all-time total: financials tables are multi-year cumulative and mix balance-sheet stock with P&L flow. **Label every output with the period + scenario it covers.**
+> 4. **Reading GROUP BY responses.** Each response returns **exactly one row per requested group** — no subtotal rows and no grand-total row mixed into the `data` list; grand totals arrive in a separate top-level `totals` field beside the rows (`{"data": [...], "totals": {...}}`), computed across **all** groups, not just the returned prefix. **For a grand total, read `totals` — never sum the rows when the response carries `truncated: true`** (summing the returned prefix silently under-counts; dev repro: 474 of 31,455 rows summed to 21% of the true total). **`totals` combines the per-group results rather than re-scanning the rows**, so it is exact exactly when the aggregation is decomposable: SUM (sum of the group sums), COUNT (sum of the group counts), MIN, and MAX. It is **WRONG for AVG** (unweighted mean of the group averages) and **COUNT_UNIQUE** (sum of the per-group distinct counts, so a value recurring across groups is counted once per group) — true average = SUM total ÷ COUNT total (two calls: a field may be aggregated at most once per request); true distinct count = the distinct-values tools. Treat every aggregation type not named exact above — **`UNIQUE_VALUES` included**, whose cross-group de-duplication is unverified (the `COUNT_UNIQUE` behaviour above is evidence the engine may not de-duplicate across groups at all) — as not decomposable: derive it from complete rows or the distinct-values tools, never from `totals`. `totals` is absent on dimension-less aggregations (the single returned row IS the total) and may be absent on responses cached before the rollout (cache TTL ≤ 7 days) — only in those two cases is a total obtained by summing complete (untruncated) rows. Null groups arrive explicitly labeled `[null]` and are real groups; read null counts from that bucket. **Defensive filter:** keep only rows in which **every requested dimension key is present** — a roll-up row *omits* one or more keys entirely, whereas a genuine null is *present* with the value `[null]`. On a correct response this is a no-op; it guards against a stale cached response still carrying legacy subtotal and grand-total rows, each of which equals the whole total and would inflate any sum. When COUNT-ing rows per group, aggregate a different field than the GROUP BY dimension itself — a same-field COUNT of the grouped dimension can 500.
+> 5. **Truncated results.** Any data tool may return `{"data": [...], "truncated": true, "total_rows": N, "returned_rows": M, "guidance": "..."}` when the result exceeds the response size limit (~50 KB). The `data` prefix is **incomplete** — never compute totals, shares, or trends from it, and never present it as the full result. On aggregations the top-level `totals` field is **unaffected by truncation** (computed across all groups, not just the returned prefix) — read grand totals from it instead of re-fetching. Narrow the query (fewer dimensions, more filters, fewer selected columns — or a business metric for a named KPI) and re-fetch **only when the rows themselves are needed** beyond the cap; with `totals` present, a SUM/COUNT/MIN/MAX grand total never requires a re-fetch or chunking by dimension (AVG, COUNT_UNIQUE and UNIQUE_VALUES never read `totals` — true average = SUM total ÷ COUNT total from two calls; true distinct count = the distinct-values tools). A truncated response **without** `totals` (pre-rollout cache) cannot answer a grand-total question from its prefix. Re-run the aggregation **once** — a fresh run may miss the stale entry and return `totals`. If the re-run still carries no `totals`, stop re-running and fall back to narrowing or chunking by dimension until the responses are complete, then sum those rows. Never total the prefix.
+
+3. Apply the data-scope preamble above to bind the query scope:
+
+   - **Scenario** (preamble item 1): from the discovered scenario domain, bind
+     `<scenario_value>` ← the value matching `--scenario` case-insensitively
+     when given, else the actuals-like value (`/actual/i`). If `--scenario`
+     matches nothing in the domain, list the scenarios that do exist and ask.
+   - **P&L grain** (preamble item 2): pull distinct values of each
+     `<account_level_fields>` candidate —
+     `start_distinct_values_by_alias(<alias>, <field>)` (or
+     `start_distinct_values_by_id(<id>, <field_id>)`) → poll the matching
+     `get_distinct_values_result_by_*(handle)` until ready (async-fetch
+     pattern); if a distinct call errors,
+     fall back to `get_data_by_alias(<alias>, select=[<field>], limit=500)` (or
+     the by-id twin) and collect the distinct values. Bind `<account_field>` to
+     the level whose values partition P&L flows into revenue/COGS/opex-like
+     buckets — do **not** assume the top level does. Then match within the
+     chosen level's values:
+     - `<revenue_value>` ← `/revenue|sales|income/i`
+     - `<cogs_value>`    ← `/cogs|cost of goods|cost of sales|direct cost/i`
+     - `<opex_value>`    ← `/operating|opex|expense|sg&a/i`
+
+     Every total in this skill is scoped to those P&L flows — balance-sheet
+     buckets stay out of the snapshot. If a category has several candidates at
+     the chosen level, pick the broadest one; if genuinely ambiguous, ask the
+     user once.
+   - **Period** (preamble item 3): discover the date field's range, then bind
+     `<period_start_epoch>` / `<period_end_epoch>` to the default scope — the
+     latest complete fiscal year, or the trailing 12 closed months when the
+     fiscal-year boundary is unclear — unless `--year` overrides the bounds.
+     Keep a human-readable `<period_label>` (e.g. `FY2025 (Jan–Dec 2025)`) for
+     the output.
+
+### Step 3: Aggregate totals by account category
+
+Alias path (preferred):
+
+```
+start_aggregation_by_alias(
+  alias=<financials_alias>,
+  dimensions=[<account_field>],
+  metrics=[{"field": <amount_field>, "agg": "SUM"}],
+  filters=[
+    {"name": <scenario_field>, "values": [<scenario_value>], "is_excluded": false},
+    {"name": <date_field>, "values": {"type": "advanced", "val": [{"condition":
+      "total_range", "value": ["<period_start_epoch>", "<period_end_epoch>"]}]}}
+  ]
+)
+```
+
+→ poll `get_aggregation_result_by_alias(handle)` until ready (async-fetch
+pattern).
+
+By-id fallback (no alias): `start_aggregation_by_id(table_id=<id>,
+dimensions=[<account_field_id>], metrics=[{"field_id": <amount_field_id>, "agg":
+"SUM"}], filters=[...])` → poll `get_aggregation_result_by_id(handle)` until
+ready — same scenario + date filters, keyed by `field_id`.
+
+Filter rules:
+- **The period filter is always on:** the advanced `total_range` date filter
+  above (epoch seconds as strings) carries the Step 2 default — latest complete
+  fiscal year / trailing 12 closed months — or the `--year` bounds when given.
+  Never run this aggregate unscoped: the table is multi-year cumulative, and an
+  all-time total misreads stock as flow.
+- Value-list filters take `values: [...]` (set `is_excluded: true` for NOT-IN).
+
+**Reading the response (preamble item 4):** every row is a real group — there
+is no total row mixed into the rows. The top-level `totals` field is the grand
+total across **all** requested account buckets together — never present it as
+any single category's total. Per-category totals (revenue, COGS, opex) are
+**your own sum of that category's rows**, from a complete response only — on
+`truncated: true`, narrow (e.g. filter to one category per call) and re-fetch.
+Read
+null groups only from the explicit `[null]` bucket (a real group, not a
+total).
+
+**If the call fails on `<account_field>` with a 500:** that field isn't usable
+as a dimension for this client. Re-inspect the Step 2 schema for a sibling
+hierarchy level (e.g. a half-level or account-group variant adjacent to the
+chosen level), re-check that its values still partition P&L flows (preamble
+item 2), and retry. If the alias call errors, retry the by-id twin. If no
+sibling works, tell the user which field failed.
+
+### Step 4: Pull the monthly trend
+
+Same call shape — same scenario + period filters — with the date added as a
+dimension:
+
+```
+start_aggregation_by_alias(
+  alias=<financials_alias>,
+  dimensions=[<date_field>, <account_field>],
+  metrics=[{"field": <amount_field>, "agg": "SUM"}],
+  filters=[
+    {"name": <scenario_field>, "values": [<scenario_value>], "is_excluded": false},
+    {"name": <date_field>, "values": {"type": "advanced", "val": [{"condition":
+      "total_range", "value": ["<period_start_epoch>", "<period_end_epoch>"]}]}}
+  ]
+)
+```
+
+→ poll `get_aggregation_result_by_alias(handle)` until ready (async-fetch
+pattern).
+
+**Each returned row is a `(month × account)` group, not a month** — this call
+carries two dimensions. Every row is a real group and no total row is appended
+to the rows (preamble item 4 — the top-level `totals` field is the grand total
+across ALL groups, not a monthly series, so it cannot substitute here), so
+**first sum the rows by `<date_field>`** to build the monthly series — complete
+responses only: on `truncated: true` narrow and re-fetch per preamble item 5 —
+keeping the `[null]` date bucket separate rather than folding
+it into a month. Only then compute direction (growing / stable / declining),
+peak month, and most recent value from that series. Reading the raw rows as a
+time series picks a single account as the "peak month" and repeats months in
+the MoM math.
+
+### Step 5: Present the snapshot
+
+Filter the Step 3 aggregate to the revenue / COGS / opex categories using the
+values discovered in Step 2:
+
+```
+## Your Financial Snapshot
+
+Period: <period_label> · Scenario: <scenario_value>
+
+Real Totals:
+- Revenue:                 $[sum of rows where account == <revenue_value>]
+- Cost of Goods Sold:      $[sum of rows where account == <cogs_value>]
+- Operating Expenses:      $[sum of rows where account == <opex_value>]
+- Gross Profit:            $[Revenue - COGS]
+- Gross Margin:            [Gross Profit / Revenue]%
+
+Monthly Trend:
+- [N] months of data
+- Most recent month: [month] — Revenue $[amount]
+- Direction: [Growing / Stable / Declining]
+
+Want to dig deeper?
+- /dr-revenue-trends     — revenue trends over time
+- /dr-expense-analysis   — detailed expense breakdown
+- /dr-forecast-variance  — actuals vs budget vs forecast
+- /dr-anomalies          — data quality check
+```
+
+## Arguments
+
+| Argument | Description | Default |
+|---|---|---|
+| `--scenario <name>` | Scenario to summarize (must exist in the discovered scenario domain) | The discovered actuals-like scenario |
+| `--year <YYYY>` | Scope to one fiscal year via the advanced date-range filter | Latest complete fiscal year (trailing 12 closed months when the fiscal-year boundary is unclear) |
+
+## Handling failures
+
+**Connection / auth error on any call:** surface the reconnect message from
+Step 1 and STOP.
+
+**No table matches the financials pattern in Step 2:** list the tables you
+found and ask the user which one holds their P&L / financial data, then
+continue.
+
+**Aggregation rejected on `<account_field>` (500) at Step 3:** swap to a
+sibling field from the Step 2 schema, or fall back from the alias path to the
+by-id twin, and retry (see Step 3). Discover lazily, fall back reactively.
+
+**`--scenario` (or the actuals-like default) isn't in the discovered scenario
+domain:** list the scenarios that do exist and ask which to use — never filter
+on an assumed scenario name.
+
+**No hierarchy level partitions P&L flows, or a category value isn't found at
+the chosen grain (Step 2.3):** present what you have, note which category
+(revenue/COGS/opex) couldn't be resolved, and never substitute a balance-sheet
+bucket for it.
+
+## Related skills
+
+- `/dr-revenue-trends` — deeper revenue narrative with composition
+- `/dr-expense-analysis` — top expense categories and concentration
+- `/dr-intelligence` — full FP&A workbook

@@ -1,0 +1,459 @@
+---
+name: dr-reconcile
+description: Whole-period consistency WORKBOOK - run independent-source checks across Finance OS data (cross-endpoint agreement, balance-sheet identity, cross-grain roll-ups, scenario/period integrity). Validates the data pipeline and mappings, not source systems. NOT a per-metric layer comparison - that is the dev-only cross-layer-reconcile harness.
+user-invocable: true
+allowed-tools:
+  - mcp__datarails-finance-os__list_data_models
+  - mcp__datarails-finance-os__list_aliased_fields
+  - mcp__datarails-finance-os__get_fields_by_id
+  - mcp__datarails-finance-os__get_data_by_alias
+  - mcp__datarails-finance-os__get_data_by_id
+  - mcp__datarails-finance-os__start_aggregation_by_alias
+  - mcp__datarails-finance-os__get_aggregation_result_by_alias
+  - mcp__datarails-finance-os__get_aggregated_data_by_alias
+  - mcp__datarails-finance-os__start_aggregation_by_id
+  - mcp__datarails-finance-os__get_aggregation_result_by_id
+  - mcp__datarails-finance-os__get_aggregated_data_by_id
+  - mcp__datarails-finance-os__start_distinct_values_by_alias
+  - mcp__datarails-finance-os__get_distinct_values_result_by_alias
+  - mcp__datarails-finance-os__get_distinct_values_by_alias
+  - mcp__datarails-finance-os__start_distinct_values_by_id
+  - mcp__datarails-finance-os__get_distinct_values_result_by_id
+  - mcp__datarails-finance-os__get_distinct_values_by_id
+  - mcp__datarails-finance-os__list_business_metrics
+  - Write
+  - Read
+  - Bash
+argument-hint: "--year <YYYY> [--scenario <name>] [--tolerance-pct <#>] [--output <file>]"
+---
+
+# Data Consistency Reconciliation
+
+Cross-check Finance OS data against itself using **independently-sourced**
+numbers — the same aggregate through two different API families, the
+balance-sheet identity, hierarchy roll-ups, and scenario/period checksums.
+Every check compares two numbers that arrive by different routes; nothing is
+ever compared against a re-read of the same aggregate (which would always
+"agree" and prove nothing).
+
+**Honest scope:** these are **data-pipeline & mapping consistency checks**,
+not source-system reconciliation. A clean pass means the data in Finance OS
+is internally consistent across endpoints, grains, and slices — it does not
+prove the numbers match the ERP/GL. State this in the report output too.
+
+Essential for month-end close and financial validation.
+
+## Excel Context — Routing Preamble
+
+Before any data pull, establish whether this skill is running in a **live Excel context**
+(Claude for Excel with the Datarails Add-In loaded) and route accordingly.
+
+**Detect — never infer from the user's wording.** A sheet list containing `__dr_agent`
+means the add-in is loaded. Confirm with the `agent.get_session` probe, which you run by
+executing Office.js through the `execute_office_js` tool (see the Excel Context Contract
+in CLAUDE.md, §Transport) — it is not an MCP tool and has no MCP equivalent.
+**A failed probe is a normal detection result**, not an error: it means "no bridge here",
+which is the expected outcome in Claude Code. Do not surface it, do not retry it, and do
+not apply this skill's connection-error or Connectors-UI guidance to it — that guidance is
+about `datarails-finance-os` connector calls only.
+**A successful probe means Excel context, on either transport.** The bridge serves two
+add-in tracks and their session payloads differ: Flex (Office.js task pane) exposes
+`isLoggedIn`; the COM desktop add-in — the majority of live workbooks — exposes
+`isConnected` instead, and **`isConnected: false` is not a login failure, an error, or a
+reason to stop or send the user anywhere**. It merely means the workbook isn't connected
+to a Datarails file, which matters only to `drilldown_*` / `create_dynamic_range` (the
+bridge skill gates those itself). Only Flex's explicit `isLoggedIn: false` means
+sign-in is needed.
+
+**Route by the target of the request, not by whether a workbook is open.**
+
+- **Org / server data** — which tables, models and fields exist, aggregations, raw rows,
+  distinct values, metrics, profiling — always the `datarails-finance-os` MCP connector,
+  **even in Excel**. The bridge cannot answer these.
+- **Workbook actions** — refresh, drill a cell, insert a DR function, read what a cell
+  returns, publish, submit — always the add-in bridge. Never a native Excel recalc
+  (`calculate()`, F9): it does not pull Datarails data and silently yields stale values.
+
+**In a live Excel context this skill cannot produce its file deliverable.** Its generation
+steps depend on the `Bash` tool, which that surface does not provide. Say so plainly and
+offer the real alternatives — a scoped answer in chat, or re-running this skill from
+Claude Code where file output works. Never improvise another route to a file, never hand
+back a partial artifact, and never silently substitute a different deliverable: writing
+into someone's live workbook instead of giving them the file they asked for is a
+different and irreversible outcome, not a smaller version of the same one.
+
+**If you do write DR formulas into the workbook, writing and refreshing are one atomic
+step.** Write to a **new sheet**, fire `refresh_selected_cells_ribbon` scoped to that
+range — a new-sheet block is one contiguous range, so one scoped call covers any cell
+count — then read the range back. `refresh_ribbon` is not the tool for this: it repulls
+every DR cell in the file and can silently move numbers elsewhere in the user's model.
+It is reserved for the one case the scoped command can't cover — scattered inserts
+across multiple sheets, per `excel-context`'s refresh-after-insert rule — and
+even then only with the user's explicit OK, after snapshotting the DR ranges you can
+bound, reporting each changed cell in them before → after with the compared ranges
+named, and saying plainly that cells beyond them may also have updated. If the user
+declines the whole-workbook refresh, fall back to scoped `refresh_selected_cells_ribbon`
+calls sheet-by-sheet — slower, but nothing outside the written cells moves. A freshly
+written DR formula reads `Missing` / `Loading…` / `#BUSY!` until an agent refresh lands,
+so never quote a value you have not read back after a successful refresh, and never
+present a figure fetched from the MCP connector as though it were the cell's value.
+`/dr-get-formula` is the full authority for DR.GET workbooks.
+
+**If the user asks you to elaborate on a DR-backed figure** — "explain", "break down",
+"what's driving this", "why is X" — and the figures in scope are DR formula cells, offer
+the add-in's drill-down instead of silently re-deriving the number through the MCP
+connector. A drill resolves the exact filters behind that cell; a hand-rebuilt query only
+approximates them.
+<!-- end:excel-context-preamble -->
+
+## How the checks source their numbers
+
+This skill is **self-contained** — it discovers the client's financials table,
+fields, and account categories inline (every Datarails environment names them
+differently; there is no saved profile). Do discovery once per conversation,
+then carry the values forward.
+
+1. **Discover the financials table and fields.** `list_data_models` → pick the
+   table whose name/alias matches `/financial|cube|p&?l|ledger|gl/i`; if
+   nothing matches, probe candidates with `get_fields_by_id(<id>)` and pick
+   the one carrying amount/scenario/date-like fields (no tool returns row
+   counts). Note **both** its numeric `id` and its `alias` (alias may be
+   empty — prefer the alias path when present). Then
+   `list_aliased_fields(<alias>)` if it has an alias, else
+   `get_fields_by_id(<id>)` (capture each field's numeric `id`). Bind by
+   case-insensitive match: `amount` (`^amount$` → `transaction_amount` →
+   `value`), `scenario` (`^scenario$` → `^version$`), `date` (`reporting_date` →
+   `posting_date` → `^date$`), and **every account-hierarchy level field**
+   present (names matching `/acc(ount)?.*l\d|account_group/i`, or any field
+   whose distinct values look like account groupings) — the checks below need
+   at least two adjacent levels. Also bind an entity-like field when one
+   exists (`/entity|company|subsidiar|legal/i`) for per-entity slicing. If a
+   binding can't be resolved by name (e.g., non-English field names), list the
+   discovered fields and ask the user which field plays which role.
+
+> **Alias coverage is per field, not per table.** A table having an alias does *not* mean its fields are aliased — real orgs often expose only a handful of aliased fields (e.g. ~5 of ~185 on a mapped financials table), and the load-bearing fields (`amount`, `scenario`, account groups, dates) are frequently *not* among them. Treat the alias/by-id choice **per field**: `get_fields_by_id(<id>)` returns every field with its numeric `id` and its `alias` (empty if none). Address a field by alias (via the `*_by_alias` tools) when it has one, else by numeric `id` (via the `*_by_id` tools). By-id always works — never abandon the query because the aliased set is thin.
+
+> **Async fetch — aggregations and distinct values run as start → poll.** `start_aggregation_by_id`/`_by_alias` and `start_distinct_values_by_id`/`_by_alias` take the same arguments as the retired blocking calls (dimensions/metrics/filters; table id + field id, or alias + field alias) and return immediately with `{"status": "pending", "handle": {...}}`. Echo that `handle` back verbatim to the matching `get_aggregation_result_by_*` / `get_distinct_values_result_by_*` tool: a `{"status": "running", "retry_after_seconds": N}` response means poll again with the same handle after ~N seconds (≈5s) — it is not an error, and large jobs may take several polls; when ready, the result arrives in the familiar shape (for distinct values, pass `limit` to the result tool). An expired/unknown-handle error means restart with the `start_*` tool. *Transitional fallback:* if the `start_*` tools aren't available on the connector (older server), the blocking twins `get_aggregated_data_by_*` / `get_distinct_values_by_*` still work with the same arguments.
+
+> **Data-scope discovery — run before any aggregate (reuse anything already discovered this conversation).**
+> 1. **Scenario domain.** Pull distinct values of the scenario field (`start_distinct_values_by_alias`/`_by_id` → poll the matching result tool) — never assume a scenario name exists (`Budget` frequently doesn't; many orgs carry only `{Actuals, Forecast}`). For budget/plan questions, if no budget-like scenario exists, look for a planning-version-like field (alias/name matching `/plan|version|cycle|budget/i`) and use its versions as the plan side; if neither exists, say so and offer a comparison across the scenarios that do exist.
+> 2. **Account grain.** Pull distinct values of each account-hierarchy level field (L0/L1/L2-like). Use the level whose values partition P&L flows into revenue/COGS/opex-like buckets — on many orgs the top level is the balance-sheet equation (ASSET/LIABILITY/EQUITY/INCOME) and P&L line items live one level deeper. For P&L work, scope to P&L flows and exclude balance-sheet buckets; never present asset/liability/equity totals as revenue or expenses.
+> 3. **Period scope.** Discover the date field's range (distinct values of the reporting-month field, or MIN and MAX in two separate calls — one aggregation per field per call). Default every P&L question to the latest complete fiscal year (or trailing 12 closed months) — never an unscoped all-time total: financials tables are multi-year cumulative and mix balance-sheet stock with P&L flow. **Label every output with the period + scenario it covers.**
+> 4. **Reading GROUP BY responses.** Each response returns **exactly one row per requested group** — no subtotal rows and no grand-total row mixed into the `data` list; grand totals arrive in a separate top-level `totals` field beside the rows (`{"data": [...], "totals": {...}}`), computed across **all** groups, not just the returned prefix. **For a grand total, read `totals` — never sum the rows when the response carries `truncated: true`** (summing the returned prefix silently under-counts; dev repro: 474 of 31,455 rows summed to 21% of the true total). **`totals` combines the per-group results rather than re-scanning the rows**, so it is exact exactly when the aggregation is decomposable: SUM (sum of the group sums), COUNT (sum of the group counts), MIN, and MAX. It is **WRONG for AVG** (unweighted mean of the group averages) and **COUNT_UNIQUE** (sum of the per-group distinct counts, so a value recurring across groups is counted once per group) — true average = SUM total ÷ COUNT total (two calls: a field may be aggregated at most once per request); true distinct count = the distinct-values tools. Treat every aggregation type not named exact above — **`UNIQUE_VALUES` included**, whose cross-group de-duplication is unverified (the `COUNT_UNIQUE` behaviour above is evidence the engine may not de-duplicate across groups at all) — as not decomposable: derive it from complete rows or the distinct-values tools, never from `totals`. `totals` is absent on dimension-less aggregations (the single returned row IS the total) and may be absent on responses cached before the rollout (cache TTL ≤ 7 days) — only in those two cases is a total obtained by summing complete (untruncated) rows. Null groups arrive explicitly labeled `[null]` and are real groups; read null counts from that bucket. **Defensive filter:** keep only rows in which **every requested dimension key is present** — a roll-up row *omits* one or more keys entirely, whereas a genuine null is *present* with the value `[null]`. On a correct response this is a no-op; it guards against a stale cached response still carrying legacy subtotal and grand-total rows, each of which equals the whole total and would inflate any sum. When COUNT-ing rows per group, aggregate a different field than the GROUP BY dimension itself — a same-field COUNT of the grouped dimension can 500.
+> 5. **Truncated results.** Any data tool may return `{"data": [...], "truncated": true, "total_rows": N, "returned_rows": M, "guidance": "..."}` when the result exceeds the response size limit (~50 KB). The `data` prefix is **incomplete** — never compute totals, shares, or trends from it, and never present it as the full result. On aggregations the top-level `totals` field is **unaffected by truncation** (computed across all groups, not just the returned prefix) — read grand totals from it instead of re-fetching. Narrow the query (fewer dimensions, more filters, fewer selected columns — or a business metric for a named KPI) and re-fetch **only when the rows themselves are needed** beyond the cap; with `totals` present, a SUM/COUNT/MIN/MAX grand total never requires a re-fetch or chunking by dimension (AVG, COUNT_UNIQUE and UNIQUE_VALUES never read `totals` — true average = SUM total ÷ COUNT total from two calls; true distinct count = the distinct-values tools). A truncated response **without** `totals` (pre-rollout cache) cannot answer a grand-total question from its prefix. Re-run the aggregation **once** — a fresh run may miss the stale entry and return `totals`. If the re-run still carries no `totals`, stop re-running and fall back to narrowing or chunking by dimension until the responses are complete, then sum those rows. Never total the prefix.
+
+2. **Map the account grains.** From the per-level distinct values pulled in
+   the data-scope preamble (item 2) — if the distinct-values start→poll pair
+   (`start_distinct_values_by_alias`/`_by_id` → `get_distinct_values_result_by_*`)
+   errors, fall back to `get_data_by_alias(<alias>, select=[<account_field>],
+   limit=500)` (or the by-id twin) and dedupe — identify two grains: the
+   **balance-sheet grain** is the level whose values look like the
+   balance-sheet equation (`/asset|liabilit|equity/i` buckets); the **P&L
+   grain** is the level whose values partition P&L flows into
+   revenue/COGS/opex-like buckets (`/revenue|sales|income/i`,
+   `/cogs|cost of goods|cost of sales|direct cost/i`,
+   `/operating|opex|expense|sg&a/i`) — often one level deeper. Then discover
+   the parent↔child mapping between the two adjacent levels with one
+   aggregate (`start_aggregation_by_alias`/`_by_id` → poll the matching
+   result tool until ready): `dimensions=[<parent_level>, <child_level>]`,
+   metric `COUNT` on a **different dense field** (a same-field COUNT of a
+   grouped dimension can 500). Every child bucket should map to exactly one
+   parent; note any that map to several parents or to `[null]`.
+
+## The checks — four independent-source comparisons
+
+All checks run under the same scope: the `--year` window as an **advanced**
+date filter — `{"name": <date_field>, "values": {"type": "advanced", "val":
+[{"condition": "total_range", "value": ["<jan1_epoch>", "<dec31_epoch>"]}]}}`
+(epoch seconds as strings; the by-id twin takes `field_id` instead of `name`)
+— and, for checks 1–3, one scenario at a time from the **discovered** scenario
+domain. Label every reported number with its period + scenario.
+
+3. **Check 1 — Cross-endpoint agreement.** Run the *same* aggregate through
+   both API families over the same table and compare per bucket **to the
+   cent**: the alias pair `start_aggregation_by_alias(<alias>,
+   dimensions=[<account_field>], metrics=[{"field": <amount_field>, "agg":
+   "SUM"}], filters=[<scenario>, <date range>])` → poll
+   `get_aggregation_result_by_alias(handle)` until ready, vs the by-id pair
+   `start_aggregation_by_id(<id>, dimensions=[<account_field_id>],
+   metrics=[{"field_id": <amount_field_id>, "agg": "SUM"}], filters=[...])`
+   → poll `get_aggregation_result_by_id(handle)` until ready.
+   This proves something only because the two pairs travel different endpoint
+   families (aliased vs raw) — and it is only possible for fields that carry
+   **both** an alias and a numeric id (per-field rule above). If the
+   load-bearing fields (amount, scenario, account level, date) are not all
+   aliased, **skip this check and note the skip in the report** — never fake
+   it by running the by-id pair twice.
+
+4. **Check 2 — Balance-sheet identity.** At the discovered balance-sheet
+   grain: `dimensions=[<bs_level>, <period_field>]` (add the entity-like
+   field as a third dimension when one exists), `SUM(<amount>)` — via
+   `start_aggregation_by_alias`/`_by_id` → poll the matching result tool
+   until ready (async-fetch pattern). Per period
+   (and entity), compare **magnitudes**: `|asset-like|` vs `|liability-like +
+   equity-like|`, and report the org's **sign convention as discovered** from
+   the data (e.g. whether liability/equity buckets arrive negative) — never
+   assumed. Balance-sheet values are *stock*, so evaluate per period; never
+   sum them across periods. If income/P&L-like buckets also live at this
+   grain, exclude them from the identity, and note that it only closes
+   exactly when the model rolls P&L into equity — if it visibly doesn't,
+   report `|A|` vs `|L + E + cumulative P&L|` and say which form was used.
+
+5. **Check 3 — Cross-grain consistency.** The P&L-grain buckets must sum to
+   their parent bucket at the level above (mapping from step 2). Two
+   aggregates over the same scope (each via `start_aggregation_by_*` → poll
+   `get_aggregation_result_by_*` until ready): `dimensions=[<parent_level>]`
+   with `SUM(<amount>)`, and `dimensions=[<parent_level>, <child_level>]` with
+   `SUM(<amount>)`. For each parent, the sum of its child rows — **including
+   the `[null]` bucket** — must equal the parent's own row to the cent. A
+   mismatch means the hierarchy mapping leaks rows (unmapped or double-mapped
+   accounts).
+
+6. **Check 4 — Scenario/period integrity.** Two grouped aggregates over the
+   scoped window (each via `start_aggregation_by_*` → poll
+   `get_aggregation_result_by_*` until ready), **no scenario filter** on
+   either: (a) `dimensions=[<scenario_field>]`, (b)
+   `dimensions=[<period_field>]`. **First apply the item-4 defensive filter —
+   keep only rows in which every requested dimension key is present** (a stale
+   cached response can carry legacy roll-up rows that omit keys and equal the
+   whole total, which would fake a mismatch), preserving genuine `[null]`
+   groups, **then sum those rows** to get that slicing's total — this check's
+   rows must be
+   summed client-side, and the responses must be **complete**: on
+   `truncated: true`, narrow (e.g. split the window into sub-ranges) and
+   stitch, never sum a prefix. The two totals must equal each other to the
+   cent, since both describe the same unfiltered window sliced two different
+   ways. A mismatch means rows are escaping one of the groupings (bad
+   scenario/date values) or the two slicings disagree about what is in scope.
+
+   > The independence of this check comes from the **two different slicings**,
+   > not from any server-provided total. For exactly that reason, **do not
+   > read the top-level `totals` field for this check**: the engine computes
+   > `totals` over the filtered window independently of the grouping, so both
+   > slicings would return the same engine number by construction and the
+   > check would pass vacuously (verified live: `totals` is byte-identical
+   > across groupings of the same window).
+
+## Arguments
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--year <YYYY>` | **REQUIRED** Calendar year to reconcile | — |
+| `--scenario <name>` | Scenario for checks 1–3 (must exist in the discovered scenario domain) | actuals-like scenario discovered at runtime |
+| `--tolerance-pct <#>` | Variance threshold for the balance-sheet identity (checks 1, 3, 4 compare to the cent) | `5.0` |
+| `--output <file>` | Output file path | `tmp/Reconciliation_YYYY_TIMESTAMP.xlsx` |
+
+## What It Validates
+
+Every check compares two **independently-sourced** numbers — two different
+endpoint families, two different grains, or the same window sliced by two
+different dimensions. Nothing is compared against a copy of itself.
+
+### 1. Cross-Endpoint Agreement
+- Same aggregate via the aliased and the raw by-id API families
+- Per-bucket match to the cent
+- Skipped (with a note) when per-field alias coverage is too thin
+
+### 2. Balance-Sheet Identity
+- |Assets| vs |Liabilities + Equity| per period (and entity)
+- Sign convention reported as discovered, never assumed
+- Evaluated at the discovered balance-sheet grain
+
+### 3. Cross-Grain Consistency
+- P&L-grain buckets roll up exactly to their parent bucket
+- Flags unmapped / double-mapped accounts (including `[null]` buckets)
+
+### 4. Scenario/Period Integrity
+- Scenario-sliced and period-sliced totals (each the sum of its own rows) agree
+  with each other to the cent
+
+**Not validated:** agreement with source systems (ERP/GL), completeness of
+the load, or business-metric engine values — the `get_business_metric_*` data
+tools are feature-gated and may be absent; `list_business_metrics` (ungated)
+may be used only to note in the report which named KPIs exist, never to fetch
+values.
+
+## Datarails Brand Styling
+
+When generating Excel or PowerPoint files, apply Datarails brand styling:
+
+**Font:** Poppins (fall back to Calibri if unavailable). Weights: 400 regular, 600 semibold, 700 bold.
+
+**Colors:**
+| Role | Hex | Use |
+|------|-----|-----|
+| Navy | `0C142B` | Header/banner background |
+| Main text | `333333` | Primary text |
+| Secondary | `6D6E6F` | Muted/subtitle text |
+| Border | `9EA1AA` | Cell borders |
+| Section bg | `F2F2FB` | Section header / row header background (lavender) |
+| Input bg | `EAEAFF` | Editable/input cell background |
+| Input text | `4646CE` | Editable cell text (indigo) |
+| Favorable | `2ECC71` | Positive variance / good KPI delta |
+| Unfavorable | `E74C3C` | Negative variance / bad KPI delta |
+| Chart 1 | `0C142B` | Actuals (navy) |
+| Chart 2 | `F93576` | Budget (hot pink) |
+| Chart 3 | `00B4D8` | Teal |
+| Chart 4 | `FFA30F` | Amber |
+
+**Excel layout:**
+- Content starts at column B (column A is a narrow gutter)
+- Rows 1-6: header banner with navy background, white title text, white subtitle
+- Gridlines OFF. Freeze panes at B7.
+- Footer as last row with generation date
+- Every cell must have font, fill, alignment, and number format set
+
+**Number formats:** `_(* #,##0_);_(* (#,##0);_(* "-"_);_(@_)` (default), `$#,##0` (dollars), `$#,##0.0,,"M"` (millions), `0.0%` (percent)
+
+**Variance coloring:** Any cell showing a delta/change: green (`2ECC71`) if favorable, red (`E74C3C`) if unfavorable. Apply automatically based on value sign and metric context.
+
+**PowerPoint:** Navy (`0C142B`) background, 16:9 widescreen, Poppins font, white text, amber (`FFA30F`) accent lines, card backgrounds `001F37`.
+
+## DR.GET Formulas — Authoring Contract
+
+If asked to add live / refreshable Datarails formulas (DR.GET) to a generated
+workbook, the only valid form is:
+
+```
+=DR.GET(Value, "[DimensionName]", CellRef, "[DimensionName]", CellRef, ...)
+```
+
+- **Never transliterate an MCP/API call into a formula.** DR.GET takes no
+  table, field, or aggregation arguments — `=DR.GET(Value,"financials","Amount","SUM",...)`
+  is invented syntax that the Datarails Add-in cannot parse or refresh.
+- Dimension names go in square brackets inside quotes (`"[Scenario]"`).
+  Dimension values are **always cell references**, never hardcoded strings.
+- Date cells referenced by formulas hold end-of-month **date serials**
+  computed from the calendar — never raw epoch timestamps from API responses
+  (epochs land a day early with a time component and never match).
+- The function token must resolve in the workbook before any formula is written —
+  but **how you make that true differs by mode, and using the file-mode method on
+  an open workbook silently breaks every cell.**
+  - **File mode (openpyxl):** create the workbook-scoped defined name
+    (`wb.defined_names.add(DefinedName("Value", attr_text='"Value"'))`), which
+    stops Excel autocorrecting the bare token to its built-in `VALUE()`.
+  - **In-sheet (a live workbook with the add-in):** **do not hand-create that
+    name.** A hand-made `Value` name satisfies the parser but registers no
+    widget, so every DR cell refreshes to **0** with no error, and
+    `evaluate_drget` reports `Widget not found: 'Value'`. Instead: **probe,
+    then register.** Write one DR cell to a scratch location and refresh it —
+    if it resolves to a number the widget is already registered (anything the
+    add-in authored will be), so skip registration and clear the cell. If it
+    reads `0`, register with `add_function_by_id` (confirm first; use the
+    catalog's register-only flag where it has one, otherwise insert into a
+    scratch cell and clear it), then refresh and re-read. **Classify an
+    existing name by what it points at:** a `widget_<id>_…` token is the
+    add-in's own and must be left alone, the literal `"<token>"` is the
+    hand-made trap and should be removed, anything else is a stop-and-ask.
+    An unregistered token reads `#VALUE!` (Excel autocorrects it to the
+    built-in `VALUE()`), not only `0`. Worked example: `get-formula` Step 7-A.
+- Bare `=DR.GET(...)` only — never wrapped in anything, including a leading
+  unary minus. The ban exists because refresh detection and read-back depend on
+  seeing the cell's own `Missing`/`Loading…`/`#BUSY!` sentinels: `IFERROR` hides
+  them, and arithmetic on a text sentinel turns it into `#VALUE!`, which is not
+  diagnosable. **Signs and derivations belong in the formula that aggregates the
+  cells, not in the cell** — a statement needing a negated or combined figure
+  writes bare DR.GET cells and does the arithmetic in a separate total row,
+  where each contributing sign is visible.
+- **Every rule here applies to the retrieval/period family** — `DR.GET`,
+  `DR.QTD`, `DR.YTD`, `DR.MTD` share one form (`=DR.QTD(Value, "[Dim]",
+  CellRef, ...)`), one cell-reference discipline, one `Value` defined-name
+  requirement, one no-wrapping rule. "DR.GET" in this contract means that
+  family. Helper functions with their own documented signatures (e.g.
+  `DR.INCLUDE`, `DR.RANGE`) are **not** covered here — author those only from
+  their own documentation, never by analogy with this form.
+- **In a live Excel context, writing DR formulas and refreshing them is one
+  atomic step** — a freshly written DR cell reads `Missing` until an agent
+  refresh lands, and only read-back values may be quoted. The Excel-context
+  routing preamble (or the skill's own Step 0 workflow) owns that procedure;
+  this contract owns the formula text.
+
+The get-formula skill (`/dr-get-formula`) is the full reference — parameter
+cells, validated dimension values, report layouts. Prefer it for whole formula
+workbooks; apply this contract when adding any retrieval/period DR formula
+(`DR.GET`/`DR.QTD`/`DR.YTD`/`DR.MTD`) to a workbook here.
+<!-- end:drget-authoring-contract -->
+
+## Output
+
+Excel report with multiple sheets:
+
+1. **Summary** - Pass/fail/skipped per check, exception count, and the scope
+   statement: *"Data-pipeline & mapping consistency checks over \<period\> /
+   \<scenario\> — not a source-system reconciliation."* Every figure labeled
+   with its period + scenario.
+2. **Check 1 - Endpoint Agreement** - alias vs by-id value per bucket, delta
+   (or the skip note when alias coverage was too thin)
+3. **Check 2 - Balance Sheet** - per-period |A| vs |L+E|, sign-convention note
+4. **Check 3 - Roll-Up** - parent totals vs child-bucket sums per parent
+5. **Check 4 - Integrity** - scenario-sliced total vs period-sliced total
+6. **Exceptions** (if any) - deltas exceeding each check's threshold
+
+## Examples
+
+### Reconcile current year (default 5% tolerance)
+```bash
+/dr-reconcile --year 2025
+```
+
+### Strict reconciliation (1% tolerance)
+```bash
+/dr-reconcile --year 2025 --tolerance-pct 1.0
+```
+
+### Reconcile specific scenario
+```bash
+/dr-reconcile --year 2025 --scenario Forecast
+```
+
+### Custom output location
+```bash
+/dr-reconcile --year 2025 --output reports/reconciliation_2025.xlsx
+```
+
+## Use Cases
+
+### Month-End Close
+Run after data extraction to validate:
+```bash
+/dr-extract --year 2025
+/dr-anomalies-report --severity critical    # Check quality
+/dr-reconcile --year 2025 --tolerance-pct 2 # Validate consistency
+```
+
+### Financial Review
+Reconcile before presentations:
+```bash
+/dr-reconcile --year 2025 --scenario Actuals
+```
+
+### Audit Preparation
+Reconcile with strict tolerance:
+```bash
+/dr-reconcile --year 2025 --tolerance-pct 0.5
+```
+
+## Performance
+
+- Year reconciliation: ~30-60 seconds
+- Runs 4 independent-source checks (check 1 may be skipped on thin alias coverage)
+- Scalable to large data volumes
+
+## Error Handling
+
+**"Account grain not found"** - Re-run discovery (`list_data_models` → `list_aliased_fields`/`get_fields_by_id` → `start_distinct_values_by_alias`/`start_distinct_values_by_id` → poll the matching `get_distinct_values_result_by_*`) and re-derive the balance-sheet and P&L grains from the discovered level values. There is no profile — discovery happens inline.
+
+**422 on aggregation** - At most one aggregation per field per call (split SUM and AVG of the same field into separate calls); SUM/AVG require a numeric or date field.
+
+**500 on COUNT** - A same-field COUNT of the GROUP BY dimension can 500 — aggregate a different dense field instead (data-scope preamble, item 4).
+
+**"Variance exceeds tolerance"** - Review the exception sheet; re-check the discovered sign convention before treating a balance-sheet delta as real.
+
+**"Incomplete data"** - Run `/dr-extract` to refresh data first
+
+## Related Skills
+
+- `/dr-extract` - Get latest financial data
+- `/dr-anomalies-report` - Check data quality
+- `/dr-dashboard` - Verify KPI values
+- `/dr-insights` - Understand trends driving reconciliation items
